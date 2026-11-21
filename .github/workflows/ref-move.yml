@@ -1,0 +1,43 @@
+name: ref-move
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: "update or delete"
+        required: true
+        default: update
+      branch:
+        required: true
+        default: prerelease
+      sha:
+        description: "target SHA; empty means this run's commit"
+        required: false
+        default: ""
+      force:
+        required: true
+        default: "false"
+permissions:
+  contents: write
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    steps:
+      - name: move
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OP: ${{ inputs.op }}
+          BRANCH: ${{ inputs.branch }}
+          SHA_IN: ${{ inputs.sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -u
+          sha="${SHA_IN:-$GITHUB_SHA}"
+          echo "before: $(gh api "repos/$GITHUB_REPOSITORY/branches/$BRANCH" --jq .commit.sha 2>&1)"
+          if [ "$OP" = delete ]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH"; rc=$?
+          else
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" -f sha="$sha" -F force="$FORCE"; rc=$?
+          fi
+          echo "rc=$rc"
+          echo "after: $(gh api "repos/$GITHUB_REPOSITORY/branches/$BRANCH" --jq .commit.sha 2>&1)"
+          exit $rc
