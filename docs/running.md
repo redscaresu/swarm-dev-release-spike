@@ -220,3 +220,4 @@ starts on one of those epics, `next` stops offering it.
   nothing when the branch changes none of those files, or only blank lines outside their functions.
 - On Bedrock, Vertex or Foundry, agents take the provider and model settings from your session;
   see [reference-building.md § Building](reference-building.md#building).
+proof: a change with no bump
