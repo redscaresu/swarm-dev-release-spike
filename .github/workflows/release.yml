@@ -158,9 +158,6 @@ jobs:
         run: |
           gh release create "${TAG}" --repo "${REPO}" --draft --target "${SHA}" \
             --title "${TAG}" --generate-notes
-      - name: proof (3b) pause after the draft so the run can be cancelled there
-        if: github.run_attempt == 1
-        run: sleep 120
       - name: Attach the binaries and the checksums file to the draft
         if: contains(format(' {0} ', steps.plan.outputs.steps), ' attach ')
         env:
