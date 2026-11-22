@@ -1,0 +1,17 @@
+{
+  "name": "swarm-dev-pre",
+  "owner": {
+    "name": "redscaresu"
+  },
+  "plugins": [
+    {
+      "name": "swarm-dev",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/redscaresu/swarm-dev-release-spike.git",
+        "ref": "prerelease"
+      },
+      "description": "prerelease"
+    }
+  ]
+}
