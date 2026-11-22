@@ -83,6 +83,9 @@ jobs:
           (cd dist || exit 1; sha256sum --strict -c "${checksums}")
           echo "checksums=${checksums}" >> "${GITHUB_OUTPUT}"
       # Named for the attempt, so the publish job takes only what this attempt built.
+      - name: proof (2a) corrupt one binary after the checksum check
+        if: contains(format(' {0} ', steps.plan.outputs.steps), ' attach ')
+        run: printf 'x' >> dist/swarm-linux-amd64
       - name: Upload dist/
         if: contains(format(' {0} ', steps.plan.outputs.steps), ' attach ')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
