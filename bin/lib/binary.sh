@@ -563,7 +563,7 @@ binary_ensure() {
 }
 
 # binary_repo — the GitHub repository whose releases hold the swarm binaries, as <owner>/<repo>.
-binary_repo() { printf '%s\n' redscaresu/swarm-dev; }
+binary_repo() { printf '%s\n' redscaresu/swarm-dev-release-spike; }
 
 # BINARY_CANNOT: binary_download's return code when the download cannot work here: this platform has no
 # release binary, gh is not on PATH, or gh release download failed (no network, no login, no such
