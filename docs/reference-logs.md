@@ -53,6 +53,7 @@ The stall rule skips those lines, because none is a sign of life.
 - `merge`: `merge` writes all its own lines, under the story's or epic's slug (the PR URL with `--board`, or before it knows the item):
   a refusal is one `merge` line saying why, and nothing else (a hold for the user, `held: ...`, ends in a `hold=` field: `hold=protected` for a protected path, `hold=money` for a `costs:` line, and `hold=dropped-lines` when the PR's own merges of the base dropped base lines or could not be checked for them; no other refusal has a field);
   each merge of the base into the PR's branch is one `merge base-merged <new head> from <old head>` line, before the `merge ok` or the refusal that follows it, or `merge merged elsewhere` when the PR merged during the wait, by another `swarm.sh merge` or by hand (§ Merging);
+  a story PR that changes a protected path, under `merge_protected = on`, gets one `merge protected path: <path>, merged under merge_protected = on` line, with no field, before the `merge ok` or the refusal that follows it;
   a PR that `gh pr merge` ran on but that never reads as merged is one `merge unconfirmed (<state>)` line;
   otherwise `merge ok`, then `main-ci` with `ok`, `red <checks>`, `timeout (<what it waited on>)` or `error <why>` (a red one followed by `main-red`, target the merge commit, outcome its repo, base and checks; an ok one that clears a red main of that repo and base by `main-green`, outcome its repo, base and the red commit it clears, and a `fix-main` line, outcome `retired: <why>`, for each unstarted fix-main story that retires), then reconcile's lines.
   A story's merge that left its wait to a newer merge (§ Merging) logs `main-ci` with `covered by <short sha> (PR #<n>)`, naming that merge's commit and PR.
@@ -470,7 +471,9 @@ no held line has no row. `--epic` does not narrow either table.
 The `gh_calls` section shows how the swarm spends GitHub's two hourly budgets (5000 GraphQL points
 and 5000 REST requests). swarm.sh puts `bin/gh-shim` first on its own PATH and on every agent's, a
 restored agent's too. The lead's own gh calls outside swarm.sh, and a person's, do not go through it
-and are not counted. The shim runs the real `gh` with the same arguments, stdin and exit code (an
+and are not counted.
+The calls that fetch an installed copy's binary on its first run go to the real `gh`, past the shim, so they are not counted either.
+The shim runs the real `gh` with the same arguments, stdin and exit code (an
 INT ends it and exits 130, as an interrupted gh would), then appends a line to the project's
 `.swarm/gh-calls.tsv`: the UTC time; the agent (its name, or `-` outside any agent); the via
 (`swarm.sh <command>` when swarm.sh made the call, a builder's `swarm.sh wait-pr` among them, else

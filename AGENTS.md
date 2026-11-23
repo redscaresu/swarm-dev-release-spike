@@ -93,6 +93,7 @@ Useful while it runs:
 - `swarm.sh tell <slug> <kind> <file>`: findings, nudge or resume sends an idle builder a file, and queues it for a busy one until its turn ends; `tell conduct-<epic> note <file>` appends it to a conductor's inbox, busy or not.
 - `swarm.sh merge [--board|--release [--upgrade]] <pr-url>`: merge a green PR in review with its head pinned, wait for CI on main, then reconcile; `--release` merges the lead's version-bump PR, and for swarm-dev's own release moves the running agents onto it only with `--upgrade` or a yes typed at a terminal.
   When the base gained more than board files since the PR's CI ran, a story PR's merge merges the base into the PR's branch and waits for CI on that head; it holds a PR that costs money or changes a protected path for the user, and a story or `--board` PR whose own merge of the base dropped a line of the base that its head has not put back, or whose merges it cannot check ([reference-merging.md § Merging](docs/reference-merging.md#merging)).
+  With `merge_protected = on` and `merge = agent` it does not hold a story PR for a protected path: it names the path and the setting, then merges it.
   After a story merge it sends the story's running conductor a note that the PR merged, naming the stories it made ready.
   After a `--board` merge it pulls the board and sends each running conductor a note naming the stories that merge made ready.
   When that PR is an epic's Finish PR, it closes the epic's conductor once the merge has exited, the conductor is idle and the lead has tried to close it since its report.
@@ -143,8 +144,10 @@ Useful while it runs:
   key in `REMOVED_KEYS` still loads for at least one release: it is ignored, with a warning on
   stderr naming it and its line (`tests/removed_test.sh` pins this).
 - A fix to the swarm's own loop (the conductor, review agent, guard or `wait` commands) ships as a
-  patch release soon after it merges, so running projects get it. The lead cuts it, through the
+  patch release soon after it merges. The lead cuts it, through the
   release arm below; a builder's story PR never bumps the version.
+  The release moves `prerelease`, so the machine on `swarm-dev@swarm-dev-pre` gets the fix at once.
+  Every other machine follows `stable`, which the lead moves when the stage ends, so it gets the fix then.
   It ships as a patch only when every change since the tag is from a `fix: true` story or a fix-main build.
   In swarm-dev's own repo, a PR that changes only files under `tests/`, and a `port: true` story's PR whose changed `tests/` files are all in its `touches`, ship as a patch too.
   Otherwise `merge --release` refuses the patch, and the fix ships in the next minor, after its retro.
@@ -343,8 +346,10 @@ When `swarm.sh next` prints `release` (`main` has changes since the last `v<vers
 release through `/swarm-dev:swarm`'s release arm and `swarm.sh merge --release`: a PR that bumps `version` in
 `.claude-plugin/plugin.json` and nothing else. `claude plugin update` fetches nothing while the version is
 unchanged. No story PR bumps it, and a story PR without a bump is not a review finding. Merging a version
-bump to `main` publishes the release and its `v<version>` tag (`.github/workflows/release.yml`); a merge
-without one publishes nothing. Before a release, bring AGENTS.md, README.md, docs/ and commands/ in
+bump to `main` publishes the release and its `v<version>` tag (`.github/workflows/release.yml`).
+The workflow attaches the four binaries and `SHA256SUMS`, then moves `prerelease`.
+It never moves `stable`; the lead does that when the stage ends.
+A merge without a bump publishes nothing. Before a release, bring AGENTS.md, README.md, docs/ and commands/ in
 line with everything merged since the last tag. `merge --release` refuses the bump while `bin/`,
 `commands/` or `hooks/` changed since that tag and README.md, AGENTS.md and `docs/` did not, unless
 the release PR body has a `Docs: none — <reason>` line.

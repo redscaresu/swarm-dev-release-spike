@@ -1,10 +1,22 @@
 # shellcheck shell=bash
-# binary.sh — find the swarm binary a command runs, run it, and download a release's binary. A hook
-# sources it on its own, and bin/swarm.sh with its other libs: it needs no other bin/lib file, sets no
-# shell option and starts no process when sourced, and binary_find and is_ported start none either.
-# binary_path and binary_run are swarm.sh's alone. Only binary_build builds, and only binary_path calls
-# it, in a git checkout. Only binary_download downloads: with gh, into a folder its caller gives, and it
-# checks the file against the release's checksum file. It never writes <root>/swarm.
+# binary.sh — find the swarm binary a command runs, run it, and fetch an installed copy's binary. A hook
+# sources it on its own, and bin/swarm.sh before its version case, not with its other libs: it needs no
+# other bin/lib file, sets no shell option and starts no process when sourced, and binary_find,
+# binary_gh_path and is_ported start none either, nor does binary_present on Linux (on macOS it starts
+# one xattr). binary_path, binary_run, binary_fetch
+# and binary_ensure are swarm.sh's alone: binary_ensure reads the version with swarm.sh's plugin_version.
+# Only binary_build builds: binary_path calls it in a git checkout, and binary_ensure in an installed copy
+# whose download cannot work. Only binary_download downloads: with gh, into a folder its caller gives, and
+# it checks the file against the release's checksum file. It never writes <root>/swarm. In an installed
+# copy only binary_fetch and binary_build write it: binary_fetch calls binary_download into a folder of
+# its own, checks the build attestation with binary_attest, then renames the file over <root>/swarm.
+# binary_ensure, which swarm.sh runs on every call but update (version goes on when it fails), calls binary_fetch when that
+# file is missing, so the checks run once, at download. The one exception is macOS's quarantine mark
+# (binary_quarantined): binary_download checks the download for it, and binary_present checks the
+# installed binary (BINARY_BUILD_PATH) for it on every call, as a mark can be added after the download.
+# When the download cannot work here (a gh too
+# old to check the attestation, or binary_fetch's BINARY_CANNOT), it builds from the source beside it
+# instead, and says so; a download that fails its checks stops the call.
 
 # BINARY_BUILD_PATH: where a git checkout of the plugin keeps the binary built from its tree, relative to
 # the plugin root. It is the file `go build ./cmd/swarm` writes at the root, which .gitignore already
@@ -73,32 +85,42 @@ BINARY_GH_MIN=2.57.0
 # network that drops packets, the call can wait for ever, and the swarm.sh call behind it with it.
 BINARY_ATTEST_SECONDS=60
 
-# binary_within <seconds> <command>... — the command in its own process group, the group KILLed after
+BINARY_WITHIN_GRACE=3   # seconds binary_within gives a TERMed group to end before it KILLs what is left
+
+# binary_within <seconds> <command>... — the command in its own process group, the group stopped after
 # <seconds> (at least 1) with exit 142; else the command's own status (128+N for a signal). gh, a Go
-# program, ignores SIGALRM, so the alarm goes to perl, which KILLs the group. A HUP, INT or TERM to perl
-# KILLs the command too and exits 128+N: in a group of its own, the command would run on with no alarm.
-# Each KILL is followed by a waitpid, so the command is reaped and gone when binary_within returns,
-# not a zombie left for init. It is merge.sh's within in whole seconds, plus that reap, copied as
-# hooks/lead-stop.sh copies it: this file needs no other bin/lib file.
+# program, ignores SIGALRM, so the alarm goes to perl, which stops the group. A HUP, INT or TERM to perl
+# stops the command too and exits 128+N: in a group of its own, the command would run on with no alarm.
+# To stop the group, perl TERMs it, gives it BINARY_WITHIN_GRACE seconds, then KILLs what is left. The
+# TERM comes first for a binary_within inside the command, such as swarm.sh update's run of a new copy's
+# swarm.sh version, whose fetch bounds gh with one: that inner perl, TERMed, stops its own group, where a
+# KILL would leave it running with no alarm. Each KILL is followed by a waitpid, so the command is reaped
+# and gone when binary_within returns, not a zombie left for init. It is merge.sh's within in whole
+# seconds, plus that reap and the TERM first, copied as hooks/lead-stop.sh copies it: this file needs no
+# other bin/lib file.
 binary_within() {
-  perl -e 'my $t = shift; $t = 1 if $t < 1;
+  perl -MPOSIX=WNOHANG -e 'my ($g, $t) = (shift, shift); $t = 1 if $t < 1;
     defined(my $p = fork) or exit 127;
     if (!$p) { setpgrp; exec @ARGV or exit 127 }
-    # The parent sets the group too, before the alarm: one that fires first would KILL no group.
+    # The parent sets the group too, before the alarm: one that fires first would stop no group.
     setpgrp $p, $p;
-    sub stop { kill "KILL", -$p, $p; waitpid $p, 0; exit shift }
+    sub stop {
+      $SIG{$_} = "IGNORE" for qw(HUP INT TERM ALRM);
+      kill "TERM", -$p;
+      for (1 .. $g * 10) { last if waitpid($p, WNOHANG); select undef, undef, undef, 0.1 }
+      kill "KILL", -$p, $p; waitpid $p, 0; exit shift }
     my %n = (HUP => 1, INT => 2, TERM => 15);
     for my $s (keys %n) { $SIG{$s} = sub { stop(128 + $n{$s}) } }
     $SIG{ALRM} = sub { stop(142) };
     alarm $t; waitpid $p, 0;
-    exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' -- "$@"
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' -- "${BINARY_WITHIN_GRACE}" "$@"
 }
 
 # binary_attest <file> <repo> <signer> — return 0 when gh verifies <file>'s build attestation: built in
 # <repo> (<owner>/<name>) on github.com, and signed by its workflow at <signer>, a path in <repo> such as
 # .github/workflows/release.yml. gh comes from PATH and needs BINARY_GH_MIN or newer. It prints none of
 # gh's output. Any failure prints one line on stderr saying what to do and returns 1: an empty argument,
-# gh's own failure, or no answer within BINARY_ATTEST_SECONDS, when binary_within KILLs gh. There is no
+# gh's own failure, or no answer within BINARY_ATTEST_SECONDS, when binary_within stops gh. There is no
 # fallback, so the caller never runs <file>. An empty <signer> stops before gh: an older gh would read
 # github.com/<repo>/ as a prefix that every workflow in <repo> matches.
 # Two runs at once are safe. gh reads <file> and never writes it. It writes only its sigstore cache
@@ -171,7 +193,8 @@ binary_go_older() {
 #     never tries to fetch a newer Go) is older than go.mod's by binary_go_older, the line names both and
 #     says to install go.mod's or reconnect so Go can fetch it. Otherwise, or with a GOVERSION it cannot
 #     read, the line says only that the build failed.
-# Only binary_path calls it.
+# binary_path calls it in a git checkout, and binary_ensure in an installed copy whose download cannot
+# work.
 binary_build() {
   local root="${1%/}" built tmp out want have
   built="${root}/${BINARY_BUILD_PATH}"
@@ -272,6 +295,273 @@ binary_run() {
   )
 }
 
+# BINARY_FETCH_TMP: the prefix of the folder binary_fetch downloads into, in the plugin root; the PID of
+# the swarm.sh that runs it follows it, so two calls never share one. The folder is on the root's own
+# filesystem, so the last step is a rename over <root>/BINARY_BUILD_PATH, and a call started meanwhile
+# never runs half a file.
+BINARY_FETCH_TMP=.fetch-
+# BINARY_REINSTALL: what a stop line of binary_fetch, binary_download or binary_ensure says to do about a
+# broken copy. It names PLUGIN, the ID the copy is installed as (plugin_id in bin/swarm.sh), so a copy
+# from swarm-dev-pre says swarm-dev@swarm-dev-pre; with PLUGIN unset (binary.sh sourced alone) it names
+# swarm-dev@swarm-dev.
+BINARY_REINSTALL="reinstall swarm-dev (claude plugin uninstall ${PLUGIN:-swarm-dev@swarm-dev}, then claude plugin install ${PLUGIN:-swarm-dev@swarm-dev})"
+
+# binary_gh_path — PATH with every empty entry and every folder whose name ends /gh-shim taken out, as
+# bin/gh-shim/gh skips them when it looks for the real gh, so the download runs no version's shim and
+# gh-calls.tsv does not log it. The other folders keep their order. Builtins only, no fork.
+binary_gh_path() {
+  local rest="${PATH}:" d out=""
+  while [[ -n "${rest}" ]]; do
+    d="${rest%%:*}"; rest="${rest#*:}"
+    [[ -n "${d}" && "${d%/}" != */gh-shim ]] || continue
+    out="${out:+${out}:}${d}"
+  done
+  printf '%s\n' "${out}"
+}
+
+# binary_present <root> — whether <root>/BINARY_BUILD_PATH, the binary an earlier call fetched, is there
+# to run. swarm.sh asks it on every call in an installed copy.
+#   0: it is an executable file, with no quarantine mark on macOS.
+#   1: there is no executable file there, and it prints nothing.
+#   2: on macOS, binary_quarantined refused it (the mark, or xattr missing or failing), with its one
+#     line on stderr. The caller stops: a fetch would download over a marked file the user should look at.
+# It tells macOS by $OSTYPE, a builtin, so on Linux it starts no process. On macOS it starts one,
+# BINARY_XATTR, on every call: a mark added after the download, by a plugin folder copied through a
+# browser or AirDrop, is caught only there.
+binary_present() {
+  local f="${1%/}/${BINARY_BUILD_PATH}" os=""
+  [[ -f "${f}" && -x "${f}" ]] || return 1
+  [[ "${OSTYPE}" != darwin* ]] || os=darwin
+  binary_quarantined "${f}" "${os}" "delete it and run the command again, which downloads and checks a new copy" || return 2
+}
+
+# binary_fetch_stop <pid> — send TERM to <pid> and to every process under it, the deepest first, as one
+# ps listing shows them. binary_fetch's traps call it: gh runs inside a $( ) of binary_download, and the
+# subshell's own trap would wait for gh to end before it ran. It runs only on a signal.
+binary_fetch_stop() {
+  local tree=" $1 " order=("$1") list p pp grew=1 i
+  list="$(ps -A -o pid= -o ppid= 2>/dev/null)" || list=""
+  while [[ ${grew} == 1 ]]; do
+    grew=0
+    while read -r p pp; do
+      [[ "${tree}" == *" ${pp} "* && "${tree}" != *" ${p} "* ]] || continue   # loose-match: ok whole-number pids, each between spaces
+      tree+="${p} "; order+=("${p}"); grew=1
+    done <<< "${list}"
+  done
+  for ((i = ${#order[@]} - 1; i >= 0; i--)); do kill -TERM "${order[i]}" 2>/dev/null || true; done
+}
+
+# binary_fetch_steps <root> <version> <dir> — binary_fetch's steps, in its subshell, with the PATH it
+# gives: mkdir <dir>; binary_download into it; binary_attest on the asset, with binary_repo and the
+# signer line of `scripts/build.sh --list`; chmod +x; mv -f over <root>/BINARY_BUILD_PATH. The asset is
+# the one asset name of --list that is a file in <dir>. Returns 0, or prints one `binary: ` line on
+# stderr and returns binary_download's code for its failures, else 1. It never removes <dir>: the
+# subshell's EXIT trap does.
+binary_fetch_steps() {
+  local root="$1" version="$2" dir="$3" build="$1/scripts/build.sh" target="$1/${BINARY_BUILD_PATH}"
+  local list kind f2 f3 asset="" n_asset=0 signer="" n_signer=0 repo
+  # -p: the folder is this call's alone, by its PID, and is no lock. One a KILLed call left under the
+  # same PID goes first.
+  rm -rf "${dir}" 2>/dev/null
+  if ! mkdir -p "${dir}" 2>/dev/null; then
+    echo "binary: could not make ${dir} to download swarm-dev's binary into: check that ${root} is writable, or set SWARMDEV_BIN to a swarm binary" >&2
+    return 1
+  fi
+  binary_download "${root}" "${version}" "${dir}" || return
+  if ! list="$("${BASH}" "${build}" --list 2>/dev/null)"; then
+    echo "binary: ${build} --list failed after the download, so the binary's signer is not known and it was not installed: ${BINARY_REINSTALL}" >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r kind f2 f3 _; do
+    case "${kind}" in
+      asset) [[ "${f3}" =~ ${BINARY_NAME_RE} && -f "${dir}/${f3}" ]] || continue   # loose-match: ok BINARY_NAME_RE is a fixed regex
+        asset="${dir}/${f3}"; n_asset=$((n_asset + 1)) ;;
+      signer) signer="${f2}"; n_signer=$((n_signer + 1)) ;;
+    esac
+  done <<< "${list}"
+  if [[ "${n_signer}" -ne 1 || -z "${signer}" ]]; then
+    echo "binary: ${build} --list has no one signer line, so the binary's build attestation cannot be checked and it was not installed: ${BINARY_REINSTALL}" >&2
+    return 1
+  fi
+  repo="$(binary_repo)"
+  if [[ "${n_asset}" -ne 1 ]]; then
+    echo "binary: ${dir} holds ${n_asset} of the asset files ${build} --list names, where the download leaves one, so none was installed: run it again, and if it fails the same way report it at https://github.com/${repo}/issues" >&2
+    return 1
+  fi
+  binary_attest "${asset}" "${repo}" "${signer}" || return 1
+  if ! chmod +x "${asset}" 2>/dev/null; then
+    echo "binary: could not make ${asset} executable: check that ${root} is writable, or set SWARMDEV_BIN to a swarm binary" >&2
+    return 1
+  fi
+  if [[ -d "${target}" ]]; then
+    echo "binary: ${target} is a folder, so the checked binary cannot be installed there: remove it and run the command again" >&2
+    return 1
+  fi
+  if ! mv -f "${asset}" "${target}" 2>/dev/null; then
+    echo "binary: could not move the checked binary to ${target}: check that ${root} is writable, or set SWARMDEV_BIN to a swarm binary" >&2
+    return 1
+  fi
+}
+
+# binary_fetch <root> <version> — download release v<version>'s binary for this platform, check it, and
+# install it as <root>/BINARY_BUILD_PATH. It returns 0, or prints one `binary: ` line on stderr and
+# returns binary_fetch_steps' code.
+#   The steps (binary_fetch_steps) run in a background subshell, with PATH from binary_gh_path and the
+#     subshell's own EXIT, INT, TERM and HUP trap, which removes their folder, <dir>:
+#     <root>/BINARY_FETCH_TMP<pid>.
+#   While they run, binary_fetch traps INT, TERM and HUP in the caller's shell: the trap sends TERM to
+#     the subshell and every process under it (binary_fetch_stop), so gh ends at once. Then the caller's
+#     own traps go back as they were, and the signal is sent again, to the caller's shell, which ends as
+#     it would have without the fetch.
+#   A KILL leaves <dir>, holding a file that is not executable yet: no call runs it, and the next call
+#   fetches again. Two calls at once each use a folder of their own, then rename, so both end with one
+#   whole binary and need no lock.
+binary_fetch() {
+  local root="${1%/}" version="${2:-}" dir saved pid="" sig="" cut=0 rc=0 code
+  dir="${root}/${BINARY_FETCH_TMP}$$"
+  saved="$(trap -p INT TERM HUP)"
+  trap 'sig=INT; cut=1; [[ -z "${pid}" ]] || binary_fetch_stop "${pid}"' INT
+  trap 'sig=TERM; cut=1; [[ -z "${pid}" ]] || binary_fetch_stop "${pid}"' TERM
+  trap 'sig=HUP; cut=1; [[ -z "${pid}" ]] || binary_fetch_stop "${pid}"' HUP
+  (
+    trap 'rm -rf "${dir}" 2>/dev/null' EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+    PATH="$(binary_gh_path)" binary_fetch_steps "${root}" "${version}" "${dir}"
+  ) &
+  pid=$!
+  [[ -z "${sig}" ]] || binary_fetch_stop "${pid}"   # a signal before $! was known
+  wait "${pid}" || rc=$?
+  # A trapped signal cuts the wait short (over 128): wait again, for the subshell's own code.
+  while [[ ${cut} == 1 && ${rc} -gt 128 ]]; do cut=0; rc=0; wait "${pid}" || rc=$?; done
+  trap - INT TERM HUP
+  eval "${saved}"
+  [[ -n "${sig}" ]] || return "${rc}"
+  case "${sig}" in INT) code=130 ;; TERM) code=143 ;; *) code=129 ;; esac
+  kill -s "${sig}" "$$"
+  return "${code}"   # the caller's own trap took the signal and went on
+}
+
+# binary_gh_unfit — print why the gh that binary_fetch would run cannot check a binary's build
+# attestation, with what to do, and return 0. It prints nothing and returns 1 when that gh can, or when
+# there is none (binary_download then says so). That gh is the first executable file named gh in the
+# folders of binary_gh_path, found with builtins and run by its path: bash 3.2's `PATH=x command -v`
+# ignores x. It reads the first line of `gh --version`, which must be exactly `gh version X.Y.Z`, with any
+# words after it ignored, and compares X.Y.Z with BINARY_GH_MIN by binary_go_older's numeric compare of
+# the dotted fields. A line it cannot read counts as too old, and the line says so: the caller then
+# builds from source, which runs nothing downloaded.
+binary_gh_unfit() {
+  local rest d gh="" out="" line have re='^gh version ([0-9]+\.[0-9]+\.[0-9]+)( |$)'
+  local fix="so swarm-dev did not download its binary: upgrade gh (https://cli.github.com), or set SWARMDEV_BIN to a swarm binary"
+  rest="$(binary_gh_path):"
+  while [[ -n "${rest}" && -z "${gh}" ]]; do
+    d="${rest%%:*}"; rest="${rest#*:}"
+    [[ ! -f "${d}/gh" || ! -x "${d}/gh" ]] || gh="${d}/gh"
+  done
+  [[ -n "${gh}" ]] || return 1
+  out="$("${gh}" --version < /dev/null 2> /dev/null)" || true
+  line="${out%%$'\n'*}"; line="${line%$'\r'}"
+  if [[ "${line}" =~ ${re} ]]; then   # loose-match: ok re is a fixed regex
+    have="${BASH_REMATCH[1]}"
+    binary_go_older "${have}" "${BINARY_GH_MIN}" || return 1
+    echo "gh ${have} is older than ${BINARY_GH_MIN}, the oldest gh that can check the binary's build attestation, ${fix}"
+  else
+    echo "gh --version's first line, '${line}', is not 'gh version X.Y.Z', so this gh counts as older than ${BINARY_GH_MIN}, the oldest that can check the binary's build attestation, ${fix}"
+  fi
+}
+
+# binary_fallback <root> <why> <tmp> — build the binary from the source at <root> with binary_build,
+# as the download cannot work here, for <why> (a line with no `binary: `). On success it prints one
+# stderr line, `binary: built from source, as <why>`, and returns 0. On binary_build's stop it prints one
+# line naming <why>, go.mod's Go version and binary_build's first line, then whatever binary_build
+# printed after that line (Go's error), and returns 1. A folder at <root>/BINARY_BUILD_PATH stops it
+# before the build, in one line naming <why> and the folder, as binary_fetch_steps refuses one: mv would
+# move the build into it. binary_build's stderr goes to <tmp>, a file the caller owns and removes.
+binary_fallback() {
+  local root="$1" why="$2" tmp="$3" line="" rest="" want target="$1/${BINARY_BUILD_PATH}"
+  if [[ -d "${target}" ]]; then
+    echo "binary: ${why}; and it could not build from source either: ${target} is a folder, so the build cannot be installed there: remove it and run the command again" >&2
+    return 1
+  fi
+  if binary_build "${root}" 2> "${tmp}"; then
+    echo "binary: built from source, as ${why}" >&2
+    return 0
+  fi
+  { IFS= read -r line || true; rest="$(cat)"; } < "${tmp}"
+  want="$(binary_go_want "${root}" 2> /dev/null)" || want=""
+  line="${line#binary: }"
+  echo "binary: ${why}; and it could not build from source either${want:+ (it needs Go ${want} or later, as go.mod names)}: ${line%:}" >&2
+  [[ ! "${rest}" =~ [^[:space:]] ]] || printf '%s\n' "${rest}" >&2
+  return 1
+}
+
+# binary_copy_lists <root> — true when <root>/scripts/build.sh is there and its --list runs. Else it
+# prints binary_download's broken-copy line, with the same first two reasons, and returns 1.
+# binary_ensure asks it when gh is too old to download, so a broken copy stops whatever the gh.
+binary_copy_lists() {
+  local build="$1/scripts/build.sh" why=""
+  if [[ ! -f "${build}" ]]; then why="${build} is missing"
+  elif ! "${BASH}" "${build}" --list > /dev/null 2>&1; then why="${build} --list failed"; fi
+  [[ -n "${why}" ]] || return 0
+  echo "binary: cannot tell which release files are this copy's binary: ${why}: ${BINARY_REINSTALL}" >&2
+  return 1
+}
+
+# binary_ensure <root> — make sure the plugin copy at <root> has its binary, and export SWARMDEV_BIN
+# naming it, so a ported command, and a helper entry that a command's bash calls, finds it. swarm.sh
+# runs it on every call but update, before it looks for a project; version prints its line and goes on.
+#   SWARMDEV_BIN set, even empty: nothing; binary_find runs that file.
+#   <root>/.git there (a git checkout): nothing; binary_path builds from the tree for a ported command.
+#   Otherwise (an installed copy): binary_present, else, for the version in
+#     <root>/.claude-plugin/plugin.json, binary_gh_unfit, then binary_fetch when gh is fit or missing.
+#     When binary_gh_unfit answers, binary_copy_lists first: a broken copy stops as binary_fetch's would.
+#     The download cannot work here when binary_gh_unfit answers (nothing is downloaded) or
+#     binary_fetch returns BINARY_CANNOT, and on nothing else: binary_fallback then builds from source.
+#     Any other code of binary_fetch's (a wrong checksum, a failed attestation, a broken copy) stops
+#     with binary_fetch's line, whether or not Go is installed.
+#   Then SWARMDEV_BIN=<root>/BINARY_BUILD_PATH, exported. When binary_present refuses the file (its 2: a
+#     quarantine mark on macOS) it returns 1 and neither fetches nor builds, so the marked file is neither
+#     run nor written over.
+# binary_fetch's and binary_build's stderr go through a file of mktemp's in TMPDIR, which it removes; a
+# call killed meanwhile leaves it, and a build killed mid-way leaves binary_build's file too.
+# With the binary present it starts no process on Linux, and one xattr on macOS (binary_present). On failure it exports nothing, leaves one `binary: `
+# line on stderr (a failed build's with Go's error after it) and returns binary_fetch's code, else 1.
+# It never dies, so its caller can go on.
+binary_ensure() {
+  local root="${1%/}" version why="" rc=0 tmp present=0
+  [[ -z "${SWARMDEV_BIN+set}" ]] || return 0
+  if [[ -z "${root}" ]]; then echo "binary: binary_ensure was given no plugin root" >&2; return 1; fi
+  [[ ! -e "${root}/.git" ]] || return 0
+  binary_present "${root}" || present=$?
+  [[ "${present}" -ne 2 ]] || return 1
+  if [[ "${present}" -ne 0 ]]; then
+    version="$(plugin_version 2>/dev/null < "${root}/.claude-plugin/plugin.json")" || version=""
+    if [[ -z "${version}" ]]; then
+      echo "binary: cannot read this copy's version from ${root}/.claude-plugin/plugin.json, so it cannot tell which release's binary to download: ${BINARY_REINSTALL}" >&2
+      return 1
+    fi
+    why="$(binary_gh_unfit)" || why=""
+    [[ -z "${why}" ]] || binary_copy_lists "${root}" || return 1
+    if ! tmp="$(mktemp "${TMPDIR:-/tmp}/swarm-binary.XXXXXX" 2> /dev/null)" || [[ ! -f "${tmp}" ]]; then
+      echo "binary: could not make a file in ${TMPDIR:-/tmp} to hold the download's messages: check that it is writable, or set SWARMDEV_BIN to a swarm binary" >&2
+      return 1
+    fi
+    if [[ -n "${why}" ]]; then
+      rc="${BINARY_CANNOT}"
+    else
+      binary_fetch "${root}" "${version}" 2> "${tmp}" || rc=$?
+      if [[ "${rc}" -eq "${BINARY_CANNOT}" ]]; then IFS= read -r why < "${tmp}" || true; why="${why#binary: }"; fi
+    fi
+    if [[ "${rc}" -eq "${BINARY_CANNOT}" ]]; then
+      rc=0; binary_fallback "${root}" "${why}" "${tmp}" || rc=1
+    elif [[ "${rc}" -ne 0 ]]; then
+      cat "${tmp}" >&2
+    fi
+    rm -f "${tmp}"
+    [[ "${rc}" -eq 0 ]] || return "${rc}"
+  fi
+  export SWARMDEV_BIN="${root}/${BINARY_BUILD_PATH}"
+}
+
 # binary_repo — the GitHub repository whose releases hold the swarm binaries, as <owner>/<repo>.
 binary_repo() { printf '%s\n' redscaresu/swarm-dev; }
 
@@ -302,11 +592,14 @@ BINARY_SUM_RE='^([^ ]+) [ *](.*)$'
 #     gh's output, only its first non-empty stderr line is ever shown.
 #   The check: the one line of the checksum file whose name field is exactly the asset's name. No such
 #     line, two of them, or another sum fails.
+#   The mark: then binary_quarantined, with the os it mapped from uname -s, so on darwin a quarantine
+#     mark on the asset, or an xattr that is missing or fails, gives its line and returns 1, never
+#     BINARY_CANNOT.
 # It writes only inside <dir>, and runs no python3 or curl.
 binary_download() {
   local root="${1:-}" version="${2:-}" dir="${3:-}" build list s m os arch kind f2 f3 why=""
   local asset="" n_asset=0 n_all=0 sums="" n_sums=0 repo report err line file got want="" n=0 sum_cmd=()
-  local fix="reinstall swarm-dev (claude plugin uninstall swarm-dev@swarm-dev, then claude plugin install swarm-dev@swarm-dev)"
+  local fix="${BINARY_REINSTALL}"
   if [[ -z "${root}" || -z "${version}" || ! -d "${dir}" ]]; then
     echo "binary: binary_download needs a plugin root, a version and an existing folder; it got '${root}' '${version}' '${dir}'" >&2
     return 1
@@ -383,4 +676,42 @@ binary_download() {
   elif [[ "${got}" != "${want}" ]]; then
     echo "binary: the SHA-256 of v${version}'s ${asset} does not match its line in ${sums}: ${report}" >&2; return 1
   fi
+  binary_quarantined "${file}" "${os}" "it was not installed: ${report}" || return 1
+}
+
+# BINARY_XATTR: the xattr binary_quarantined runs on macOS, named by its absolute path and never looked
+# up on PATH, where any folder ahead of /usr/bin could answer for it. A test sets it after sourcing.
+BINARY_XATTR=/usr/bin/xattr
+# BINARY_QUARANTINE: the extended attribute macOS sets on a file that a browser, AirDrop or a mail app
+# wrote, which Gatekeeper checks before the file first runs.
+BINARY_QUARANTINE=com.apple.quarantine
+
+# binary_quarantined <file> <os> <fix> — return 0 when <file> carries no macOS quarantine mark. <os> is
+# the platform as binary_download maps uname -s: only on darwin does it look, by running
+# `BINARY_XATTR <file>`, which lists <file>'s extended attributes one name a line, the one process it
+# starts. On any other <os> it starts nothing and returns 0. On darwin it prints one `binary: ` line on
+# stderr and returns 1, with no fallback, so the caller neither installs nor runs <file>:
+#   a listed name is exactly BINARY_QUARANTINE: the line says <file> carries the mark, then <fix>, what
+#     the caller says to do;
+#   BINARY_XATTR is not an executable file, or it exits non-zero (it could not read <file>): the mark
+#     cannot be checked, so it fails closed.
+# It lists the names rather than asking for the one attribute (xattr -p), because -p exits 1 both when
+# the attribute is absent and when it cannot read the file, so a failed read would pass as no mark.
+binary_quarantined() {
+  local file="$1" os="$2" fix="$3" names name
+  [[ "${os}" == darwin ]] || return 0
+  if [[ ! -f "${BINARY_XATTR}" || ! -x "${BINARY_XATTR}" ]]; then
+    echo "binary: ${BINARY_XATTR} is not an executable file, so whether ${file} carries macOS's quarantine mark cannot be checked, and swarm.sh did not run it: check that macOS's xattr is at ${BINARY_XATTR}, or set SWARMDEV_BIN to a swarm binary" >&2
+    return 1
+  fi
+  if ! names="$("${BINARY_XATTR}" "${file}" </dev/null 2>/dev/null)"; then
+    echo "binary: ${BINARY_XATTR} could not list the extended attributes of ${file}, so whether it carries macOS's quarantine mark cannot be checked, and swarm.sh did not run it: ${fix}" >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    [[ "${name}" != "${BINARY_QUARANTINE}" ]] && continue
+    echo "binary: ${file} carries macOS's quarantine mark (${BINARY_QUARANTINE}), so swarm.sh did not run it: ${fix}" >&2
+    return 1
+  done <<< "${names}"
+  return 0
 }

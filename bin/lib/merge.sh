@@ -25,7 +25,8 @@ FIX_MAIN_LOG_SECONDS=600  # how long fix_main waits for the failed runs to finis
 FIX_MAIN_REPO=.         # the repo: of a fix-main story fix_main writes outside a merge (main_red_run), . for the project's own
 BASE_HEAD_WAIT=30       # how long reconcile's read of a red base's head commit may take (green_mains)
 ANCESTRY_WAIT=30        # how long fix_main's read of which repo the project's clone is may take (fix_ancestry)
-RELEASE_WAIT=600        # how long merge --release waits for the release's tag and GitHub release (SWARM_RELEASE_WAIT)
+RELEASE_WAIT=600        # how long merge --release waits for the release's tag, GitHub release, files and RELEASE_BRANCH (SWARM_RELEASE_WAIT)
+RELEASE_BRANCH=prerelease  # the branch release.yml moves to a release's tagged commit last (its REF); stable is never checked, as no workflow moves it
 PLUGIN_UPDATE_WAIT=300  # how long each claude plugin update a release runs may take (within)
 HERDR_LIST_WAIT=30      # how long a release's read of herdr's agent list may take
 UPGRADE_START_WAIT=120  # how long the new version's swarm.sh upgrade may take to start its worker (SWARM_UPGRADE_START_WAIT)
@@ -423,7 +424,10 @@ merge_hold() {
 # hold=protected. --board changes only board paths, never a protected path. --release changes
 # .claude-plugin/plugin.json, a protected path in this plugin's own repo, and goes unheld only because
 # its route never calls this. With merge = human it does not run: merge_grant, later in merge_pr,
-# refuses such a PR (pr_hld puts it under no HLD).
+# refuses such a PR (pr_hld puts it under no HLD). With merge_protected = on, a PR that changes a
+# protected path is not held: it prints the path and the setting, logs that line as a merge line with no
+# hold= field and drops the record, and merge_pr goes on to its other holds. A list it could not read
+# still holds the PR.
 protected_hold() {
   local why
   if [[ $1 -ne 0 ]]; then
@@ -432,6 +436,13 @@ protected_hold() {
   fi
   why="$(cut -d' ' -f2- <<< "$2" | protected_paths "${repo}" any-case)"
   why="${why%%$'\n'*}"
+  # shellcheck disable=SC2154 # assigned in another file
+  if [[ -n "${why}" && "${CFG_merge_protected}" == on ]]; then
+    protected_note
+    echo "protected path: ${why}, merged under merge_protected = on"
+    record_event merge "${MERGE_TARGET}" "protected path: ${why}, merged under merge_protected = on"
+    return 0
+  fi
   protected_note "${why}"
   [[ -z "${why}" ]] || merge_fail "held: ${MERGE_TARGET} changes ${why}, which only the user merges$(own_unknown "${repo}" "${why}"); the user merges it" hold=protected
 }
@@ -462,7 +473,7 @@ protected_note() {
 # (pinned_files), as the grant's are, so a push after the pin cannot hide an epic, and only where a
 # check reads them: protected_hold under merge = agent, and the guard when the board is in the
 # project's repo, lead_epics is off and the PR changes a file. With merge = agent a story PR that
-# changes a protected path, or whose files cannot be read, is the user's (protected_hold): after the
+# changes a protected path (unless merge_protected = on), or whose files cannot be read, is the user's (protected_hold): after the
 # story lookup, so a PR no story in review lists is refused as such, and after the head's CI check, so
 # a red head costs no compare read; before the guard, so its hold is the line said. A story PR in
 # another repo changes that repo's epics/, not the board's (story_elsewhere, asked only of a PR with a
@@ -868,13 +879,13 @@ base_accepted_from() {
 # to bring only the base's content); any other merge is scanned, web-flow's too (a conflict resolved in
 # GitHub's web editor).
 # With none left it exits 0 with no scan; else, with git at DROPPED_GIT_MIN or newer, it asks
-# merged_parent about each merge left, passes dropped_lines.py each second parent it names as
-# `--merged <sha>`, so a stacked build's merge of a merged parent's branch is scanned against that
-# branch, and prints dropped_lines.py's lines and exits with its code: 0 none, 1 lines dropped (only with a
-# `<sha7> <file>: <text>` line printed), 2 cannot check. Every other stop, a die or a set -e one, exits
+# merged_parent about each merge left, passes dropped_lines.py each second parent and squash it names as
+# `--merged <sha>:<squash>`, so a stacked build's merge of a merged parent's branch is scanned against
+# the squashes of the PRs that hold that branch, and prints dropped_lines.py's lines and exits with its
+# code: 0 none, 1 lines dropped (only with a `<sha7> <file>: <text>` line printed), 2 cannot check. Every other stop, a die or a set -e one, exits
 # 2 (swarm.sh's trap; DROPPED_FOUND marks the exit 1).
 dropped_lines() {
-  local story="" repo n head base url src shas out tip merges m p ver rc=0 keep=() args=() own=()
+  local story="" repo n head base url src shas out tip merges m p sha ver rc=0 keep=() args=() own=()
   local limit="${SWARM_BASE_MOVED_WAIT:-${BASE_MOVED_WAIT}}"
   local usage="dropped-lines: usage: swarm.sh dropped-lines [--story <slug>] <owner/repo> <n> <40-character head SHA> <base>"
   if [[ "${1:-}" == --story ]]; then
@@ -908,7 +919,7 @@ dropped_lines() {
   args=("${keep[@]}")
   for m in "${keep[@]}"; do
     p="$(merged_parent "${repo}" "${m}")" || die "dropped-lines: ${p}"
-    [[ -z "${p}" ]] || args+=(--merged "${p}")
+    for sha in ${p}; do args+=(--merged "${sha}"); done   # <second parent>:<squash>, one per merged PR
   done
   rc=0; out="$(python3 "${SWARM_HOME}/bin/lib/dropped_lines.py" "${src}" "${tip}" "${head}" ${own[@]+"${own[@]}"} "${args[@]}")" || rc=$?
   case ${rc} in
@@ -922,10 +933,12 @@ dropped_lines() {
   esac
 }
 
-# merged_parent <owner/repo> <merge> — the second parent of <merge> when it is a stacked build's merge of a
-# parent's branch whose PR has merged (dropped_lines), read in the clone and against the base pr_fetch
-# fetched (DROPPED_DIR, DROPPED_TIP): <merge> has two parents, neither on the fetched base, and gh lists a
-# merged PR that holds the second parent whose merge commit (the parent's squash) is on the fetched base.
+# merged_parent <owner/repo> <merge> — `<second parent>:<squash>` lines when <merge> is a stacked build's
+# merge of a parent's branch whose PR has merged (dropped_lines), read in the clone and against the base
+# pr_fetch fetched (DROPPED_DIR, DROPPED_TIP): <merge> has two parents, neither on the fetched base, and gh
+# lists a merged PR that holds the second parent whose merge commit (merge_commit_sha, the parent's squash)
+# is on the fetched base. One line per such PR, as stacked PRs share commits; dropped_lines.py checks the
+# merge against those squashes.
 # Nothing for any other merge, which dropped_lines.py scans or refuses as before. gh's
 # commits/<sha>/pulls is GitHub's record of the PRs whose commits hold <sha>, a merged PR's commits too,
 # so no branch name or story is guessed at. When gh fails or does not answer within BASE_MOVED_WAIT, it
@@ -943,8 +956,9 @@ merged_parent() {
   if [[ ${rc} -ne 0 ]]; then echo "gh cannot list the PRs that hold ${ps[2]:0:7}, merge ${m:0:7}'s second parent: ${out##*$'\n'}"; return 1; fi
   for sha in ${out}; do
     [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || continue
-    if git -C "${src}" merge-base --is-ancestor "${sha}" "${tip}" 2>/dev/null; then echo "${ps[2]}"; return 0; fi
+    if git -C "${src}" merge-base --is-ancestor "${sha}" "${tip}" 2>/dev/null; then echo "${ps[2]}:${sha}"; fi
   done
+  return 0
 }
 
 # pr_fetch <who> <owner/repo> <n> <head> <base> — fetch PR <n>'s head and <base> for a read of its
@@ -1176,7 +1190,7 @@ short_shas() {
 # and merges that head, the head for every check below), a story or epic in review
 # lists the URL (with merge = agent, by any route, pr_held finds nothing: whoever calls it, a PR whose
 # story or stacked parent costs money is the user's; and on this route, once the head's CI check has
-# passed, its files at the pinned head change no protected path (protected_hold: .claude/, .github/,
+# passed, its files at the pinned head change no protected path, unless merge_protected = on (protected_hold: .claude/, .github/,
 # hooks/ or a root Makefile, and in this plugin's own repo internal/guard/, internal/merge/,
 # internal/release/, internal/agentenv/, internal/layers/ or .claude-plugin/, a renamed file's old path
 # too), which only
@@ -2678,25 +2692,33 @@ wait_pr() {
 # release_upgrade <owner/repo> <merge commit> <version> <main-ci exit> <base> <checked> <upgrade> — after
 # merge --release of this plugin's own repo (plugin_repo), with CI on the base green and <checked> set
 # (the merge commit is on the base release_check read: release_parent): once release_confirmed, update
-# the marketplace and the plugin. Then, once release_move says yes (<upgrade> set by --upgrade, or a y
+# the marketplace and the plugin, else warn, naming what RELEASE_UNMET says is unmet. Then, once release_move says yes (<upgrade> set by --upgrade, or a y
 # on a terminal), start the new version's swarm.sh upgrade (detached; bounded by UPGRADE_START_WAIT;
 # with release_path's PATH, so the agents it restarts find the new swarm.sh) in each of
 # agent_projects; else start none and print `upgrade not run: <why>` with the command for each. Last,
 # ask the user to restart the lead session in this project and each of those: the update is global,
 # and Claude Code loads a plugin's hooks only at startup. A step that fails warns, naming what to run
 # by hand; an upgrade that fails, times out or finds another upgrade running there (it starts nothing
-# then and still exits 0) warns and moves on to the next project. The release is done either way.
+# then and still exits 0) warns and moves on to the next project. None of these changes merge's exit code.
 # Each claude, gh and herdr call is bounded (within).
 release_upgrade() {
-  local own new d hint out restart="${PROJECT_DIR}" rc path dirs why cmds=""
+  local own new d hint out restart="${PROJECT_DIR}" rc path dirs why cmds="" at
   own="$(plugin_repo)" || { echo "the plugin's plugin.json names no GitHub repository, so it is not updated"; return 0; }
   [[ "$(tr '[:upper:]' '[:lower:]' <<< "$1")" == "${own}" ]] || { echo "$1 is not this plugin's repo (${own}), so the plugin is not updated"; return 0; }
   new="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/plugins/cache/${MARKETPLACE}/${PLUGIN%@*}/$3/bin/swarm.sh"
   hint="run swarm.sh update, then ${new} upgrade in each project with agents"
   [[ $4 -eq ${MAIN_CI_OK} ]] || { echo "warning: CI on the base is not green, so the plugin was not updated: once v$3 is published, ${hint}"; return 0; }
   [[ -n "$6" ]] || { echo "refused: the release ships commits no release check read, so the plugin was not updated and no agent was moved: once they are checked, ${hint}"; return 0; }
-  release_confirmed "$1" "$2" "$3" "$5" \
-    || { echo "warning: no tag v$3 on the base at or after ${2:0:7} with a published GitHub release, so the plugin was not updated: once there is, ${hint}"; return 0; }
+  if ! release_confirmed "$1" "$2" "$3" "$5"; then
+    case "${RELEASE_UNMET}" in
+      list\ *) echo "warning: scripts/build.sh --list cannot name the files v$3's release must hold (${RELEASE_UNMET#list }), so the plugin was not updated: once you have checked that each is uploaded, ${hint}" ;;
+      files\ *) echo "warning: v$3's GitHub release has no uploaded ${RELEASE_UNMET#files }, so the plugin was not updated: once each is uploaded, ${hint}" ;;
+      branch\ *) at="${RELEASE_UNMET#branch }"
+        echo "warning: ${RELEASE_BRANCH} is at ${at% *}, not at v$3's tag commit ${at##* }, so the plugin was not updated: once release.yml has moved it there, ${hint}" ;;
+      *) echo "warning: no tag v$3 on the base at or after ${2:0:7} with a published GitHub release, so the plugin was not updated: once there is, ${hint}" ;;
+    esac
+    return 0
+  fi
   if ! { within "${PLUGIN_UPDATE_WAIT}" claude plugin marketplace update "${MARKETPLACE}" \
       && within "${PLUGIN_UPDATE_WAIT}" claude plugin update "${PLUGIN}"; } </dev/null; then
     echo "warning: updating the plugin to $3 failed, so no agent was moved: ${hint}"; return 0
@@ -2769,26 +2791,74 @@ plugin_own() {
   own="$(plugin_repo)" && [[ "$(tr '[:upper:]' '[:lower:]' <<< "$1")" == "${own}" ]]
 }
 
-# release_confirmed <owner/repo> <merge commit> <version> <base> — the tag v<version> is on <merge
-# commit>, or on a later commit of <base> (a later push's release run can tag first: release.yml runs
-# one at a time), and its GitHub release is published, waiting up to RELEASE_WAIT seconds for the
-# release workflow, which a green main need not have waited for. Each read gets the time left, at
-# least RELEASE_READ_FLOOR; a tag's commit is judged once (release_on_base), until the tag moves.
+# release_confirmed <owner/repo> <merge commit> <version> <base> — the release v<version> is done: its
+# tag is on <merge commit>, or on a later commit of <base> (a later push's release run can tag first:
+# release.yml runs one at a time); its GitHub release is published and lists each file release_files
+# names, by exact name, in state uploaded; and RELEASE_BRANCH is at the tag's commit. Equal, not ahead:
+# a later release run that moved it on means an update would install that later version. It waits up
+# to RELEASE_WAIT seconds for the release workflow, which a green main need not have waited for and
+# which moves RELEASE_BRANCH last. Each read gets the time left, at least RELEASE_READ_FLOOR; a tag's
+# commit is judged once (release_on_base), until the tag moves; a poll reads on only while what it has
+# read holds. On failure RELEASE_UNMET says what the last poll found unmet, for release_upgrade:
+#   list <why>                   release_files failed, so it failed at once, with no gh read
+#   files <name>, <name>...      the release lacks these files, or has not uploaded them
+#   branch <sha7> <tag sha7>     RELEASE_BRANCH is not at the tag; <sha7> is `a commit gh cannot read`
+#                                on a failed or malformed read
+#   tag                          no tag on the base, or a release that is a draft or cannot be read
 release_confirmed() {
-  local end=$((SECONDS + ${SWARM_RELEASE_WAIT:-${RELEASE_WAIT}})) tag seen="" good="" v
+  local end tag seen="" good="" v files rel ref
+  RELEASE_UNMET=tag
+  if ! files="$(release_files)"; then RELEASE_UNMET="list ${files}"; return 1; fi
+  end=$((SECONDS + ${SWARM_RELEASE_WAIT:-${RELEASE_WAIT}}))
   while :; do
+    RELEASE_UNMET=tag
     tag="$(within "$(release_left "${end}")" gh api "repos/$1/git/ref/tags/v$3" 2>/dev/null | json "d['object']['sha']" 2>/dev/null)" || tag=""
     if [[ "${tag}" =~ ^[0-9a-f]{40}$ && "${tag}" != "${seen}" ]]; then
       v="$(release_on_base "$1" "$2" "${tag}" "$4" "${end}")"
       [[ -z "${v}" ]] || { seen="${tag}"; good="${v}"; }
     fi
-    if [[ -n "${tag}" && "${tag}" == "${seen}" && "${good}" == yes \
-      && "$(within "$(release_left "${end}")" gh api "repos/$1/releases/tags/v$3" 2>/dev/null | json "d['draft']" 2>/dev/null)" == False ]]; then
-      return 0
+    if [[ -n "${tag}" && "${tag}" == "${seen}" && "${good}" == yes ]]; then
+      # The draft flag, then each of <files> with no asset of exactly its name in state uploaded.
+      rel="$(within "$(release_left "${end}")" gh api "repos/$1/releases/tags/v$3" 2>/dev/null \
+        | RELEASE_FILES="${files}" json "' '.join([str(d['draft'])] + [n for n in e['RELEASE_FILES'].split() if n not in [a.get('name') for a in d.get('assets') or [] if a.get('state') == 'uploaded']])" 2>/dev/null)" || rel=""
+      if [[ "${rel}" == False ]]; then
+        ref="$(within "$(release_left "${end}")" gh api "repos/$1/git/ref/heads/${RELEASE_BRANCH}" 2>/dev/null | json "d['object']['sha']" 2>/dev/null)" || ref=""
+        [[ "${ref}" =~ ^[0-9a-f]{40}$ && "${ref}" == "${tag}" ]] && return 0
+        if [[ "${ref}" =~ ^[0-9a-f]{40}$ ]]; then ref="${ref:0:7}"; else ref="a commit gh cannot read"; fi
+        RELEASE_UNMET="branch ${ref} ${tag:0:7}"
+      elif [[ "${rel}" == "False "* ]]; then
+        rel="${rel#False }"; RELEASE_UNMET="files ${rel// /, }"
+      fi
     fi
     ((SECONDS < end)) || return 1
     sleep "${SWARM_MERGE_POLL:-$(scaled "${MERGE_POLL}")}"
   done
+}
+
+# release_files — the names of the files each release of this copy holds, space-separated, from
+# `scripts/build.sh --list` under SWARM_HOME, the release contract: each asset line's name (its third
+# field) and the sha256 checksums line's (its second), in --list's order. These are binary_download's
+# rules (bin/lib/binary.sh), kept apart from its download: --list runs, it has exactly one sha256
+# checksums line and at least one asset line, and every name matches BINARY_NAME_RE. Else it prints
+# why, naming build.sh, and fails. It reads no network.
+release_files() {
+  local build="${SWARM_HOME}/scripts/build.sh" list kind f2 f3 names="" n_asset=0 n_sums=0 bad=""
+  [[ -f "${build}" ]] || { echo "${build} is missing"; return 1; }
+  list="$("${BASH}" "${build}" --list 2>/dev/null)" || { echo "${build} --list failed"; return 1; }
+  while IFS=$'\t' read -r kind f2 f3 _; do
+    case "${kind}" in
+      asset) n_asset=$((n_asset + 1)); names+="${names:+ }${f3}"
+        [[ "${f3}" =~ ${BINARY_NAME_RE} ]] || bad="'${f3}'" ;;   # loose-match: ok BINARY_NAME_RE is a fixed regex
+      checksums) [[ "${f3}" == sha256 ]] || continue
+        n_sums=$((n_sums + 1)); names+="${names:+ }${f2}"
+        [[ "${f2}" =~ ${BINARY_NAME_RE} ]] || bad="'${f2}'" ;;   # loose-match: ok BINARY_NAME_RE is a fixed regex
+    esac
+  done <<< "${list}"
+  if [[ "${n_sums}" -ne 1 ]]; then echo "${build} --list has no one sha256 checksums line"; return 1
+  elif [[ "${n_asset}" -eq 0 ]]; then echo "${build} --list has no asset line"; return 1
+  elif [[ -n "${bad}" ]]; then echo "${build} --list names ${bad}, which is not a plain file name"; return 1
+  fi
+  echo "${names}"
 }
 
 # release_left <end> — the seconds a release read may take: those left before <end>, at least RELEASE_READ_FLOOR.

@@ -54,7 +54,7 @@
 #   swarm.sh review-agent --next <slug> <pr-url>            from review-<slug>'s own pane, its next round in the same session, or the same round again when the PR's head moved with no findings sent since that round started: once the worktree is at the PR's head, move the last findings aside, record the head, and print the round and what it runs; starts no agent
 #   swarm.sh review-agent --recheck <slug> <pr-url> <old head> <file:line>...   from review-<slug>'s own pane, after a wording fix: pass when the PR's new head is green and its diff from <old head> rewrites each named line (as at <old head>) and nothing else, the lines the old head's .round.md names, writing the new head's findings file, a pass, and .head; else refuse, writing nothing, and name --next, which that refusal counts the round for, when the old head, its findings, the diff or a red head rule the recheck out
 #   swarm.sh version                                        the installed version, and a warning when a newer one is out
-#   swarm.sh update                                         update the plugin to the newest version
+#   swarm.sh update                                         update the plugin to the newest version, then run that version's swarm.sh version once, within 5 minutes
 #
 # The project is, first match wins: $SWARM_PROJECT; the nearest directory up from here with
 # .claude/swarm/config (mapped to the main checkout when it is in a git worktree); the main checkout
@@ -122,11 +122,30 @@ awk -v k="${SWARM_SLEEP_SCALE:-1}" 'BEGIN { exit !(k ~ /^[0-9]*\.?[0-9]+$/ && k 
 # The framework itself: this script's repo, whose docs/method.md the briefs point at.
 SWARM_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Where the newest version is published, and the plugin's name in Claude Code. SWARM_LATEST_URL is
-# overridable so the tests need no network.
-LATEST_URL="${SWARM_LATEST_URL:-https://raw.githubusercontent.com/redscaresu/swarm-dev/main/.claude-plugin/plugin.json}"
+# plugin_id <plugin root> — set PLUGIN, the plugin's ID in Claude Code (<plugin>@<marketplace>), and
+# MARKETPLACE, the marketplace it was installed from, from <root>'s path. Claude Code installs a plugin
+# at <dir>/plugins/cache/<marketplace>/<plugin>/<version>, so swarm-dev@swarm-dev-pre sits at
+# plugins/cache/swarm-dev-pre/swarm-dev/<version>. Only whole path segments count: the two above
+# <marketplace> must be exactly plugins, then cache. Any other path (a git checkout, a test's tree)
+# leaves swarm-dev@swarm-dev and swarm-dev. It uses parameter expansion alone, as every call pays for it.
 PLUGIN=swarm-dev@swarm-dev
 MARKETPLACE=swarm-dev
+plugin_id() {
+  local up="${1%/*}" plugin market
+  plugin="${up##*/}"; up="${up%/*}"
+  market="${up##*/}"; up="${up%/*}"
+  [[ -n "${plugin}" && -n "${market}" && "${up}" == */plugins/cache ]] || return 0
+  PLUGIN="${plugin}@${market}"; MARKETPLACE="${market}"
+}
+plugin_id "${SWARM_HOME}"
+
+# Where the newest version this copy can get is published: plugin.json on the ref its marketplace
+# follows, prerelease for swarm-dev-pre and stable for any other (a checkout included). main runs ahead
+# of both, so a copy that read it was warned about a version it could not install. SWARM_LATEST_URL is
+# overridable so the tests need no network.
+LATEST_REF=stable
+if [[ "${MARKETPLACE}" == swarm-dev-pre ]]; then LATEST_REF=prerelease; fi
+LATEST_URL="${SWARM_LATEST_URL:-https://raw.githubusercontent.com/redscaresu/swarm-dev/${LATEST_REF}/.claude-plugin/plugin.json}"
 
 # plugin_version — the top-level "version" string of the plugin.json on stdin, as python3's json.load
 # reads it, in bash builtins alone: each process start counts in the speed job. It scans the text,
@@ -201,12 +220,16 @@ plugin_version() {
   printf '%s\n' "${ver}"
 }
 
-# show_version — the installed version; when a newer one is published, a warning and how to update.
-# A failed lookup (offline) is not an error: /swarm-dev:swarm must still run.
+# show_version — the installed version; then, in an installed copy with no binary, binary_ensure, which
+# fetches this version's binary or builds it from source; then, when a newer one is published, a warning
+# and how to update. Neither failure is an error, so /swarm-dev:swarm still runs: when binary_ensure
+# fails, what it printed stays on stderr (one `binary: ` line, then Go's error after a failed build) and
+# version goes on, and a failed lookup (offline) prints nothing.
 show_version() {
   local have latest
   have="$(plugin_version < "${SWARM_HOME}/.claude-plugin/plugin.json")"
   echo "swarm-dev ${have}"
+  binary_ensure "${SWARM_HOME}" || true
   latest="$(curl -fsSL --max-time 5 "${LATEST_URL}" 2>/dev/null | plugin_version 2>/dev/null)" || return 0
   python3 -c "import sys; v=lambda s: tuple(int(x) for x in s.split('.')); sys.exit(v(sys.argv[2]) <= v(sys.argv[1]))" \
     "${have}" "${latest}" || return 0
@@ -217,18 +240,77 @@ then restart Claude Code so the new version is loaded.
 EOF
 }
 
-# update_plugin — fetch the newest version. Claude Code loads it on its next start.
+UPDATE_WAIT=300   # seconds update gives the new copy's swarm.sh version, which can build Go from source
+# SWARM_UPDATE_WAIT overrides it, for tests, when it is a whole number of seconds; anything else is ignored.
+[[ ! "${SWARM_UPDATE_WAIT:-}" =~ ^[1-9][0-9]*$ ]] || UPDATE_WAIT="${SWARM_UPDATE_WAIT}"
+
+# installed_path <file> <plugin ID> — print the installPath of the one entry with scope user under
+# plugins[<plugin ID>] in <file>, Claude Code's installed_plugins.json, and return 0. The ID matches
+# exactly, and no version folder is guessed: after a rollback the entry names the older one. Otherwise
+# print why not (an unreadable file, no such entry, more than one, no installPath) and return 1.
+installed_path() {
+  local out
+  out="$(python3 -I -c '
+import json, sys
+f, pid = sys.argv[1], sys.argv[2]
+try:
+    with open(f) as fh:
+        d = json.load(fh)
+    es = d["plugins"][pid] if pid in d["plugins"] else []
+    es = [e for e in es if isinstance(e, dict) and e.get("scope") == "user"]
+except Exception:
+    print("%s could not be read" % f); sys.exit(1)
+if len(es) != 1:
+    print("%s has %s user entries for %s" % (f, len(es) or "no", pid)); sys.exit(1)
+p = es[0].get("installPath")
+if not isinstance(p, str) or not p:
+    print("the user entry for %s in %s has no installPath" % (pid, f)); sys.exit(1)
+print(p)' "$1" "$2" 2>/dev/null)" && { printf '%s\n' "${out}"; return 0; }
+  printf '%s\n' "${out:-python3 could not read $1}"
+  return 1
+}
+
+# update_plugin — fetch the newest version of the plugin this copy is installed as (MARKETPLACE, then
+# PLUGIN: plugin_id), then run the copy Claude Code loads next (installed_path) once: its swarm.sh version
+# fetches or builds that copy's binary, within UPDATE_WAIT seconds, its output shown. When that copy cannot
+# be found, or its run fails or passes the bound, one line says why and that swarm.sh version after the
+# restart fetches it; update still exits 0. This copy fetches nothing for itself. Claude Code loads the new
+# version on its next start.
 update_plugin() {
+  local file="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}/plugins/installed_plugins.json" path why="" rc=0
   claude plugin marketplace update "${MARKETPLACE}"
   claude plugin update "${PLUGIN}"
+  if ! path="$(installed_path "${file}" "${PLUGIN}")"; then
+    why="${path}"
+  elif [[ ! -f "${path}/bin/swarm.sh" ]]; then
+    why="${path}/bin/swarm.sh does not exist"
+  else
+    binary_within "${UPDATE_WAIT}" bash "${path}/bin/swarm.sh" version < /dev/null || rc=$?
+    if [[ "${rc}" -eq 142 ]]; then
+      why="its swarm.sh version did not finish within ${UPDATE_WAIT} s"
+    elif [[ "${rc}" -ne 0 ]]; then
+      why="its swarm.sh version exited ${rc}"
+    fi
+  fi
+  [[ -z "${why}" ]] \
+    || echo "The new version's binary was not fetched (${why}): run swarm.sh version after the restart, which fetches it."
   echo "Restart Claude Code to load the new version."
 }
+
+# The binary's lib comes first: binary_ensure, below and in show_version, runs before a project is looked
+# for. It starts no process when sourced, so update pays nothing for it.
+# shellcheck source=bin/lib/binary.sh
+source "${SWARM_HOME}/bin/lib/binary.sh"
 
 # Neither needs a project: they run before one is looked for.
 case "${1:-}" in
   version) show_version; exit ;;
   update)  update_plugin; exit ;;
 esac
+
+# Every other call, inside a project or not, first makes sure an installed copy has its checked binary
+# (binary_ensure). When it cannot, its one line is the call's last: no command's bash runs.
+binary_ensure "${SWARM_HOME}" || exit 1
 
 # main_checkout <dir> — <dir> as it sits in its repo's main checkout, so a worktree resolves to the
 # same project as the checkout it came from. Fails when <dir> is not in a git repo.
@@ -312,6 +394,7 @@ CFG_fallback_reviewer="" # empty: a codex usage or rate limit, unreachable codex
 # shellcheck disable=SC2034 # lead: nothing reads it since dash was deleted; a config that sets it still loads
 CFG_lead=off            # kept so a config that sets it still loads
 CFG_merge_admin=off     # on: swarm.sh merge passes --admin to gh pr merge, once its own checks pass (a ruleset that wants an approving review)
+CFG_merge_protected=off # on: under merge = agent, swarm.sh merge does not hold a reviewed story PR that changes a protected path; its other holds stay
 CFG_review_verify=ci    # full: a review agent's round 1 may run the selected tests and check mutation proofs; ci: every round trusts CI
 CFG_demote_kinds=""      # empty: off; else finding kinds, comma-separated, that rounds before the round cap send only as a regression or a now-false line
 # shellcheck disable=SC2034 # nothing reads it yet; epic-guard-board-pr does
@@ -319,7 +402,7 @@ CFG_lead_epics=off      # on: the lead may set an epic active on its own; off: a
 CFG_commit_trailers=""  # empty: none; else trailers every builder adds to each commit, ; between several
 CFG_agent_env=""        # empty: none; else variable names every agent gets with the session's values, such as a provider's key
 CFG_usage_warn_percent="" # empty: off; else a percent, 1 to 100: wait --lead warns once a usage week when the usage estimate reaches it
-CONFIG_KEYS="board_dir repos_dir base_branches sign_commits merge stall_minutes queue_minutes sonnet_share risky_effort escalate_after escalate_ladder step_up_findings top_rung_rounds builder_subagent_model goal codex_minutes fallback_reviewer lead merge_admin review_verify demote_kinds lead_epics commit_trailers agent_env usage_warn_percent"
+CONFIG_KEYS="board_dir repos_dir base_branches sign_commits merge stall_minutes queue_minutes sonnet_share risky_effort escalate_after escalate_ladder step_up_findings top_rung_rounds builder_subagent_model goal codex_minutes fallback_reviewer lead merge_admin merge_protected review_verify demote_kinds lead_epics commit_trailers agent_env usage_warn_percent"
 for _key in ${CONFIG_KEYS}; do printf -v "SRC_${_key}" default; done
 # Keys an older swarm-dev read: a config that sets one still loads, with a warning, whatever its value.
 REMOVED_KEYS="pr_per finished review_bot keep_panes"
@@ -377,8 +460,8 @@ load_config() {
         [[ "${value}" == off || "${value}" =~ ^[1-9][0-9]*$ ]] || die "${where}: goal must be off or a positive whole number of turns, not '${value}'" ;;
       lead)
         [[ "${value}" == off || "${value}" == session ]] || die "${where}: lead must be off or session, not '${value}'" ;;
-      merge_admin)
-        [[ "${value}" == off || "${value}" == on ]] || die "${where}: merge_admin must be off or on, not '${value}'" ;;
+      merge_admin|merge_protected)
+        [[ "${value}" == off || "${value}" == on ]] || die "${where}: ${key} must be off or on, not '${value}'" ;;
       review_verify)
         [[ "${value}" == ci || "${value}" == full ]] || die "${where}: review_verify must be ci or full, not '${value}'" ;;
       demote_kinds)
@@ -617,8 +700,6 @@ cut_names() {
 
 json() { python3 -c "import json,os,sys; d=json.load(sys.stdin); e=os.environ; print($1)"; }
 
-# shellcheck source=bin/lib/binary.sh
-source "${SWARM_HOME}/bin/lib/binary.sh"
 # shellcheck source=bin/lib/agents.sh
 source "${SWARM_HOME}/bin/lib/agents.sh"
 # shellcheck source=bin/lib/reports.sh

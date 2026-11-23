@@ -152,6 +152,64 @@ included, at list prices. `swarm.sh flow` shows where your own tokens went.
 Settings live in `.claude/swarm/config`; [reference-models.md § Settings](reference-models.md#settings)
 lists them all.
 
+## First run
+
+An installed copy of swarm-dev has no `swarm` binary until its first `swarm.sh` call fetches one.
+Every call does this except `swarm.sh update`, inside a project or not.
+`swarm.sh update` fetches nothing for the running copy.
+It runs the newly installed copy's `swarm.sh version`, which fetches that copy's binary.
+Each version fetches its own binary once:
+
+1. `gh release download` fetches the release's binary for this machine, and its `SHA256SUMS`, into a new `.fetch-<pid>` folder in the plugin folder.
+2. swarm.sh checks the binary's SHA-256 against its line in `SHA256SUMS`.
+3. `gh attestation verify` checks that swarm-dev's release workflow built it.
+4. swarm.sh moves the binary to `swarm` in the plugin folder, then removes the `.fetch-<pid>` folder.
+
+Later calls find `swarm` there and check nothing again, except on macOS, where every call checks it for the quarantine mark.
+The fetch runs the real `gh`, past swarm-dev's gh-shim, and needs gh 2.57.0 or newer, logged in.
+A git checkout of swarm-dev never fetches: it builds the binary from its own tree.
+With `SWARMDEV_BIN` set, swarm.sh runs that file and fetches nothing.
+
+When the download cannot work here (no binary for this platform, no gh, a gh older than 2.57.0, or a failed `gh release download`), a machine with Go builds the binary from source instead, as [Offline](#offline) says.
+Otherwise, or when that build fails too, the call stops with one line that starts `binary:`, and the command does not run.
+`swarm.sh version` is the exception: it prints that line after its version line, and goes on.
+What each line means:
+
+- `swarm-dev publishes no binary for <os>/<arch>`: build one with `go build ./cmd/swarm` and set `SWARMDEV_BIN` to its path.
+- `gh is not on PATH`: install the GitHub CLI and run `gh auth login`.
+- `gh <version> is older than 2.57.0`, or `gh --version's first line ... is not 'gh version X.Y.Z'`: upgrade gh. Nothing was downloaded.
+- `gh release download ... failed`: the line quotes gh. Fix what it says (no network, or no login), then run the command again.
+- `gh attestation verify failed`, with `(no answer within 60 s)` when gh did not answer: check that gh is 2.57.0 or newer, logged in and online.
+- `the SHA-256 of ... does not match`: the file is not the one the release lists, so it was not installed. Run the command again, and report it if it fails the same way.
+- `has no line naming`, `names ... on <n> lines`, `left no`, or `holds <n> of the asset files`: the release is not laid out as swarm-dev expects. Run the command again, and report it if it fails the same way.
+- `could not take the SHA-256`: install `sha256sum` or `shasum`.
+- `cannot tell which release files are this copy's binary`, `cannot read this copy's version`, or a line about `--list`: the plugin folder is broken. Reinstall swarm-dev.
+- `could not make` or `could not move`: the plugin folder is not writable.
+- `is a folder`: something left a folder named `swarm` in the plugin folder. Remove it.
+- `carries macOS's quarantine mark`: macOS puts this mark on a file that a browser, AirDrop or a mail app writes, and swarm.sh will not run a binary that has it. It checks the download, and on every call it checks the `swarm` file in the plugin folder, as copying the plugin folder can add the mark later. Delete that `swarm` file and run the command again: the call downloads and checks a new copy. If the download itself had the mark, run the command again, and report it if it fails the same way. A line that says `/usr/bin/xattr is not an executable file`, or that it `could not list the extended attributes`, means swarm.sh could not check for the mark, so it did not run the binary.
+
+A fetch stopped by Ctrl-C or a TERM removes its `.fetch-<pid>` folder.
+A KILL leaves the folder with the downloaded files in it, none of them executable.
+No call runs them, the next call fetches again, and you can delete the folder.
+Two calls at once each fetch into a folder of their own, then move a checked binary into place, so both run a whole binary.
+
+## Offline
+
+With no network, an installed copy's first call cannot download its binary.
+If Go is installed, it builds the binary from the source in the plugin folder instead, prints one line, `binary: built from source, as <why the download could not work>`, and the command runs.
+It builds the same way whenever the download cannot work here: no binary for this platform, no gh, a gh older than 2.57.0, or a failed `gh release download`.
+The build needs the Go version that the plugin's go.mod names, or newer.
+An older Go fetches that version itself, which needs the network.
+If Go is missing or the build fails, the call stops with one `binary:` line, then any error Go printed, and the command does not run.
+The line names why the download could not work, the Go version go.mod names, and why the build failed.
+A download that fails a check (a wrong SHA-256, or a failed attestation) never builds, whether or not Go is installed: the call stops with the check's line.
+A build that is stopped part way leaves no `swarm`.
+It can leave a `swarm.build-<pid>` file in the plugin folder, which no call runs; the next call builds again, and you can delete the file.
+Once the binary is there, a call needs no network to find it.
+`swarm.sh version` and `swarm.sh update` never need the binary, so they still run.
+`swarm.sh version` still tries the download and the build, and prints their `binary:` lines after its version line.
+`swarm.sh update` does the same for the new version: it runs that copy's `swarm.sh version` once, which tries the download and the build for that copy.
+
 ## Updating
 
 When the lead merges a swarm-dev release with `swarm.sh merge --release`, it updates the plugin.
@@ -161,13 +219,33 @@ the merge and passes `--upgrade` when you say yes; run by hand on a terminal, me
 moves no agent and prints `upgrade not run:` with the command to run in each project. Either way,
 it then asks you to restart the lead session (`/exit`, then `claude --continue`). If a PR landed on the base after the release was
 checked, it names the commits that shipped unchecked and updates nothing. In that case, or when
-you release some other way, update by hand:
+you release some other way, run `swarm.sh update`.
+
+`swarm.sh update` updates the plugin ID this copy is installed as.
+For a stable install it runs:
 
 ```bash
 claude plugin marketplace update swarm-dev && claude plugin update swarm-dev@swarm-dev
 ```
 
-Restart Claude Code afterwards. Agents already running stay on the old version until
+For a prerelease install it runs:
+
+```bash
+claude plugin marketplace update swarm-dev-pre && claude plugin update swarm-dev@swarm-dev-pre
+```
+
+Then it runs the new version's `swarm.sh version` once, within 5 minutes, and shows its output.
+That fetches the new version's binary, as [First run](#first-run) describes, or builds it, as [Offline](#offline) describes, before your next session starts.
+It finds the new version in Claude Code's `installed_plugins.json`, by the one user entry for the plugin ID.
+When it cannot find it there, or that run fails or takes longer than 5 minutes, it prints one line saying the new version's binary was not fetched and that `swarm.sh version` after the restart fetches it.
+It still exits 0.
+Restart Claude Code afterwards.
+
+After a plain `claude plugin update`, run `swarm.sh version` yourself once Claude Code has restarted.
+When it can neither fetch nor build the binary, it says why after its version line, in one line that starts `binary:` and then any error Go printed, and still exits 0.
+The next `swarm.sh` call tries again.
+
+Agents already running stay on the old version until
 `swarm.sh upgrade <epic>` restarts them on the new one, each resuming its own session. A builder
 waits while the Claude review agent reviewing its PR is busy and still on the old version. upgrade
 runs detached until every agent is moved, and prints its log, `.swarm/upgrade-<version>.log`.

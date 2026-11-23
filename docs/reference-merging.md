@@ -105,6 +105,10 @@ When it still cannot read them, it holds the PR and says why.
 A hold from a passing error (three 5xx in a row, a read past the bound, a file count GitHub briefly reports wrong) clears on the next `swarm.sh merge`, so run it again; a PR of over 300 files (the most the compare lists) or of no file is never readable, so that hold stands.
 `--board` PRs cannot change those paths; a `--release` PR changes `.claude-plugin/plugin.json`, and goes unheld because its route never runs this hold.
 Nothing else lifts a protected-path hold for one PR: you merge it by hand, and the next reconcile finishes the story.
+With `merge_protected = on` in `.claude/swarm/config`, `swarm.sh merge` does not hold a story PR that changes a protected path.
+It prints `protected path: <path>, merged under merge_protected = on`, logs that line as a `merge` line, drops the item's `protected:` record and merges the PR as it does any reviewed story PR.
+The setting lifts only that hold. A file list it cannot read still holds the PR, and the `costs: money` hold, the dropped-lines hold, the CI gate, the review gate and the guard hook's refusals all stay.
+It ships `off`, and it changes nothing under `merge = human`, where an HLD's `merge` grant still does not cover a protected path.
 `swarm.sh merge` records either hold on the item in review, as `protected: <PR URL> <head> <time> <path>` (or `unreadable: <why>` in place of the path) in its board-state file, and drops it when a later `swarm.sh merge` of that PR finds no protected path.
 `status` and `wait --lead` read the record with no gh call.
 They leave it out once a `wait --lead` heads pass made after the hold read the PR at another head (`.swarm/lead/held`); with no such pass, as when no `wait --lead` runs, the hold stands.
@@ -270,15 +274,19 @@ look the same. A stacked build keeps its parent's merges in its history after th
 merge lands on the base, so a line one of those merges dropped on purpose stops counting once the
 squash has taken it off the base.
 Once the parent's PR has merged, the build's own merge of the parent's branch is checked against
-that branch, the way a merge of the base is checked against the base. A line it dropped that the
-parent's branch had prints while the base still has it.
+that PR's squash commit on the base, the way a merge of the base is checked against the base.
+The base squash-merges, so the parent's own commits never reach it, and its squash commit stands for them.
+A line the merge dropped counts when the squash commit's file has it, or the file of a base commit the build's side already holds, and prints while the base still has it.
 A line the parent added counts from the build's first merge of the base after the parent's squash: before that, the PR's merge base with the base has no copy of it, so the PR's merge cannot delete it.
 The build's side of that merge can hold commits of the base that the parent's branch lacks: it started on another parent's branch, cut from a newer base, or it merged the base itself.
-A line of those commits that the merge dropped would not be in the parent's branch's file, so such a merge is checked only when it is git's own merge of the two, with no conflict resolved by hand and no edit.
-Resolved or edited by hand, it cannot be checked, and the PR is held as for any merge the scan cannot read.
-`dropped-lines` asks gh which PR holds
-the merge's second parent, and treats that commit as the parent's branch when the PR has merged and
-its merge commit is on the base. Until the parent's PR merges, the merge cannot be checked. The check
+Such a merge is checked whether git made it or the builder resolved it by hand.
+The build's side of a conflict in it is read too, since it can hold the base's lines.
+When the build's own commits added copies of a line dropped there, a count cannot tell whose copy went, and the merge is unchecked.
+Before this check, a merge resolved by hand whose build side held newer base commits could not be checked even after the parent merged, as with fetch-ensure's merge of fetch-download on [#1126](https://github.com/redscaresu/swarm-dev/pull/1126).
+`dropped-lines` asks gh which PRs hold the merge's second parent.
+It takes the merge commit (`merge_commit_sha`) of each one that has merged, with that commit on the base, as a squash.
+Stacked PRs share commits, so gh can list more than one, and a line counts when any of those squashes has it.
+Until the parent's PR merges, the merge cannot be checked. The check
 used to refuse such a merge even after the parent merged, which stopped the review of four story PRs
 that had merged their parent's branch while stacked
 ([#879](https://github.com/redscaresu/swarm-dev/pull/879),
@@ -1114,7 +1122,9 @@ stands in for the docs PR. For swarm-dev's own repo, the release PR body also li
 changes every project gets on upgrade and names the infrafactory build they were tried on, or says
 none. With `merge = agent` the
 lead merges it with `swarm.sh merge --release` and checks that the tag and the GitHub release
-exist. With `merge = human` it waits on your merge.
+exist.
+For swarm-dev's own repo, merge also checks that the release has its five files uploaded and that `prerelease` is at the tag's commit.
+With `merge = human` it waits on your merge.
 
 Epics can name the release they belong to with `stage: v<x.y.z>`. Once a release is due, `next`
 reads the stages: the epics on the board, whatever their status, the copies `origin/<base>` has of
@@ -1174,10 +1184,16 @@ plugin's `plugin.json`; otherwise merge prints a line saying it skipped this ste
 agents onto it. After
 that warning it updates nothing, and prints `refused: the release ships commits no release check
 read, so the plugin was not updated`, followed by what to run once they are checked. Otherwise it
-waits up to 10 minutes (`SWARM_RELEASE_WAIT`) for the tag `v<new>` on the merge commit, or on a
-later commit of the base, and a published GitHub release. Then it runs `claude plugin marketplace
-update swarm-dev` and `claude plugin update swarm-dev@swarm-dev`, 5 minutes at most each. Once the
-new version's `swarm.sh` is in the plugin cache, it moves the agents only with `--upgrade`. Without
+waits up to 10 minutes (`SWARM_RELEASE_WAIT`) for the release to be done.
+A release counts done only when the tag `v<new>` is on the merge commit or a later commit of the base, its GitHub release is published, every file is uploaded and `prerelease` is at the tag's commit.
+The files are the five that `scripts/build.sh --list` names (the four binaries and `SHA256SUMS`), each matched by exact name and in state `uploaded`.
+release.yml moves `prerelease` last, so the branch must be exactly at the tag's commit: a branch past it means a later release has moved it on.
+Then it runs `claude plugin marketplace
+update <marketplace>` and `claude plugin update <plugin>@<marketplace>`, 5 minutes at most each.
+They name the marketplace and plugin ID of the swarm-dev copy that runs the merge, which it reads from where Claude Code installed that copy, `plugins/cache/<marketplace>/<plugin>/<version>`.
+So a stable install runs them with `swarm-dev` and `swarm-dev@swarm-dev`, and a prerelease install with `swarm-dev-pre` and `swarm-dev@swarm-dev-pre`.
+A copy anywhere else, such as a git checkout, uses `swarm-dev` and `swarm-dev@swarm-dev`.
+Once the new version's `swarm.sh` is in the plugin cache, it moves the agents only with `--upgrade`. Without
 it, on a terminal it asks `Move the running agents onto v<new> now? [y/N]` and moves them only on
 `y`. With no terminal (the lead runs merge in the background), or any other answer, it moves none
 and prints `upgrade not run: <why>`, naming `--upgrade` for next time and the `swarm.sh upgrade`
@@ -1193,10 +1209,17 @@ then `claude --continue`) in this project and in every project it found. The upd
 a plugin's hooks only at startup, and until a lead restarts, the `swarm.sh` on its PATH is the old
 one. When CI on the base is not green, the release can't be confirmed or the update fails, it prints
 a warning naming the new version's `swarm.sh upgrade` to run once the plugin is updated, and
-upgrades nothing. An upgrade that fails, takes too long to start, or finds another upgrade already
+upgrades nothing.
+When the release can't be confirmed, the warning says what was missing:
+- `no tag v<new> on the base at or after <sha7> with a published GitHub release`: the tag is not on the base, or the release is still a draft or gh can't read it.
+- `v<new>'s GitHub release has no uploaded <file>, ...`: each file the release lacks, or has not finished uploading.
+- `prerelease is at <sha7>, not at v<new>'s tag commit <sha7>`: release.yml has not moved the branch yet, or a later release moved it on.
+  When gh can't read the branch, it names `a commit gh cannot read`.
+- `scripts/build.sh --list cannot name the files v<new>'s release must hold (<why>)`: the copy that runs merge has no `scripts/build.sh`, or its `--list` failed or broke the contract, so merge does not wait.
+
+An upgrade that fails, takes too long to start, or finds another upgrade already
 running in its project and starts nothing gets the same kind of warning, and merge moves on to the
-next project. The release still counts as done, and neither these warnings nor the refusal above
-changes merge's exit code.
+next project. Neither these warnings nor the refusal above changes merge's exit code.
 
 ### The build check
 
@@ -1291,7 +1314,7 @@ It skips only the merges that `swarm.sh merge` recorded as `base-merged` in even
 Any other merge is scanned, a GitHub web-editor merge included.
 For a merge with neither parent on the fetched `<base>`, it asks gh which PRs hold the merge's second parent (`repos/<owner/repo>/commits/<sha>/pulls`).
 When one of them has merged and its merge commit is on the fetched `<base>`, the merge is a stacked build's merge of its parent's branch: it is scanned with that branch in the base's place, and a line it dropped counts only while the base still has it.
-Where that merge's first parent holds a commit of `<base>` that the parent's branch lacks, the merge is scanned only when its `git show --remerge-diff` is empty: otherwise it exits 2 naming the merge.
+A dropped line counts as the base's when one of those merge commits (the parents' squashes) has it, or a commit of `<base>` that the merge's first parent holds has it, whether git made the merge or a builder resolved it by hand.
 When gh cannot list those PRs, it exits 2 naming the merge.
 Each dropped line prints as `<sha7> <file>: <text>`.
 It exits 0 when nothing was dropped, 1 when it printed a line, and 2 when it cannot check: bad arguments, another origin, a head that moved or a stale fetch (naming both SHAs), git below 2.36, or a merge it cannot scan (an octopus, or one with neither parent on the base whose second parent is on no merged PR's branch).

@@ -45,6 +45,7 @@ run `start` again for the next edit. `done` also clears a start you abandoned wi
 
 First run `swarm.sh version`. If it prints a WARNING, show it to the user word for word, then carry on:
 an old version still runs.
+The WARNING names a newer version on the ref this install follows: `prerelease` for an install from swarm-dev-pre, `stable` for every other install.
 
 When the user has updated the plugin while a conductor runs, run `swarm.sh upgrade` (with no
 epic, it moves every agent the project started). It moves them to the new version with `--resume`,
@@ -705,7 +706,8 @@ Repeat until a step below says stop:
      Then go by whether merge printed `merged:`, not by its exit code:
      - It printed `merged:`, even if it then exited non-zero (red CI on the base also printed `fix-main:`
        and wrote a story; a CI timeout wrote none): tell the user what it printed. For swarm-dev's own
-       repo, merge has confirmed the tag and the GitHub release, updated the
+       repo, merge has confirmed the release is done (the tag, the published GitHub release with its
+       five files uploaded, and `prerelease` at the tag's commit), updated the
        plugin and, with `--upgrade`, started the agents' upgrade: tell the user its restart line
        (`/exit`, then `claude --continue`), its `upgrade not run:` line and any warning it printed. If CI on the base was not green, merge
        updated nothing and printed a warning naming what to run once the release is published:
@@ -718,7 +720,9 @@ Repeat until a step below says stop:
        `<url> is MERGED, not open` (the user merged it) or `unconfirmed (...)` and `gh pr view` shows
        it MERGED, merge stopped before it waited for CI on the base or ran the upgrade: look at CI on
        the base yourself, check the tag and the release, and tell the user the plugin update did not
-       run. Remove the worktree and the branch, and go back to 1.
+       run. For swarm-dev's own repo the release counts done only once
+       `gh release view v<new> --json assets` lists its five files with state `uploaded` and
+       `gh api repos/<owner>/<repo>/git/ref/heads/prerelease` is at the tag's commit. Remove the worktree and the branch, and go back to 1.
      - It refused because of the PR: a version not greater than the base's, more changed than the
        version, a fix on it, a missing docs PR or `Docs: none` line, a head that moved, or a PR that is
        CLOSED. The lead acts, under both settings: do what the refusal says (a fix or the docs goes to

@@ -50,9 +50,10 @@ stories). A run can stop anywhere, and the next `/swarm-dev:swarm` picks up wher
 |---|---|---|
 | [Claude Code](https://claude.com/claude-code) | 2.1.145+ | runs every agent |
 | [herdr](https://herdr.dev) | 0.9.2+ | the terminal multiplexer: one pane per agent |
-| [GitHub CLI](https://cli.github.com) | logged in | PRs, CI checks, merges |
+| [GitHub CLI](https://cli.github.com) | 2.57.0+, logged in | PRs, CI checks, merges, and fetching the `swarm` binary |
 | [codex CLI](https://github.com/openai/codex) | logged in | the second reviewer, a different model family |
 | `git`, `python3`, `bash` | any recent | the `swarm.sh` scripts |
+| [Go](https://go.dev/dl/) | 1.27.1+ (go.mod's), optional | builds the `swarm` binary from source when the download cannot work |
 | a GitHub repo | with `make check` | CI and the pre-commit hook run it |
 | [Obsidian](https://obsidian.md) | optional | browse the board as a vault |
 
@@ -63,6 +64,8 @@ stories). A run can stop anywhere, and the next `/swarm-dev:swarm` picks up wher
    ```bash
    claude plugin marketplace add redscaresu/swarm-dev && claude plugin install swarm-dev@swarm-dev
    ```
+
+   This installs the stable release, which moves when a stage ends.
 
 2. In your project's folder, run `claude` once and accept "do you trust this folder?". Agents cannot
    start in a folder you have not trusted.
@@ -123,8 +126,13 @@ It is only an estimate, and it counts Fable low until you give it a `/usage` rea
 ## Updating
 
 ```bash
-claude plugin marketplace update swarm-dev && claude plugin update swarm-dev@swarm-dev
+swarm.sh update
 ```
+
+It updates the plugin, then runs the new version's `swarm.sh version` once, within 5 minutes, so that version's binary is ready.
+For a stable install it runs `claude plugin marketplace update swarm-dev` and `claude plugin update swarm-dev@swarm-dev`.
+For a prerelease install it runs `claude plugin marketplace update swarm-dev-pre` and `claude plugin update swarm-dev@swarm-dev-pre`.
+If you run those two yourself, run `swarm.sh version` after the restart.
 
 Restart Claude Code afterwards. [Updating](docs/running.md#updating) covers moving running agents
 to the new version.
